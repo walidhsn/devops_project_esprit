@@ -1,0 +1,7 @@
+docker run -d \
+  --name prometheus \
+  --restart always \
+  -p 9090:9090 \
+  -v prometheus_config:/etc/prometheus \
+  -v prometheus_data:/prometheus \
+  prom/prometheus
