@@ -1,18 +1,29 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: mysql-pvc
+  namespace: webapps
 spec:
   accessModes:
     - ReadWriteOnce
   resources:
     requests:
       storage: 5Gi
+  storageClassName: local-path
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: mysqldb
+  namespace: webapps
 spec:
   ports:
     - port: 3306
@@ -25,6 +36,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mysql-deployment
+  namespace: webapps
 spec:
   replicas: 1
   selector:
@@ -42,9 +54,9 @@ spec:
             - containerPort: 3306
           env:
             - name: MYSQL_ROOT_PASSWORD
-              value: "root" 
+              value: "root"
             - name: MYSQL_DATABASE
-              value: "timesheet-devops-db"
+              value: "foyer_db"
           volumeMounts:
             - name: mysql-data
               mountPath: /var/lib/mysql
