@@ -10,7 +10,8 @@ pipeline {
         DB_CONTAINER_NAME = 'mysql-test'
         DB_USER = 'root'
         DB_PASSWORD = 'root'
-        DB_NAME = 'timesheet_devops_db'
+        DB_NAME = 'foyer_db'
+        DOCKER_REPO = 'walidhsn/benhassouna_walid_tpfoyer'
     }
     stages {
         stage('Git Checkout') {
@@ -21,7 +22,7 @@ pipeline {
                     git config --global user.name "walidhsn"
                     git config --global user.email "walid.benhassouna@gmail.com"
                     '''
-                git credentialsId: 'git-cred', url: 'https://github.com/walidhsn/timesheet-devops.git'
+                git credentialsId: 'git-cred', url: 'https://github.com/walidhsn/tp_foyer.git'
             }
         }
          stage('Clean') {
@@ -48,24 +49,25 @@ pipeline {
                         sh "while ! docker exec ${c.id} mysqladmin ping -h127.0.0.1 -P3306 --silent; do sleep 1; done"
                         
                         // Run tests with the database container
-                        sh "SPRING_DATASOURCE_URL=jdbc:mysql://localhost:${port}/${env.DB_NAME} mvn test"
+                        sh "SPRING_DATASOURCE_URL=jdbc:mysql://localhost:${port}/${env.DB_NAME} mvn clean install"
                     }
                 }
+                junit '**/target/surefire-reports/TEST-*.xml'
             }
         }
          stage('File System Scan') {
             steps {
-                sh "trivy fs --format table -o trivy-fs-report.html ."
+                sh "trivy fs --db-repository public.ecr.aws/aquasecurity/trivy-db:2 --format table -o trivy-fs-report.html ."
             }
         }
          stage('SonarQube Analysis') {
             steps {
                  withSonarQubeEnv('sonar') {
                     sh ''' 
-                        $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=timesheet \
-                        -Dsonar.projectKey=timesheet \
+                        $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=tpfoyer \
+                        -Dsonar.projectKey=tpfoyer \
                         -Dsonar.java.binaries=. \
-                        -Dsonar.exclusions=trivy-fs-report.html,trivy-image-report.html
+                        -Dsonar.exclusions=trivy-fs-report.html,trivy-image-report.html,test/java/**
                     '''
                 }
             }
@@ -77,7 +79,18 @@ pipeline {
                 }
             }
         }
-                stage('Clean Workspace') {
+        stage('Get Version from POM') {
+            steps {
+                script {
+                    // Extract version from pom.xml
+                    def version = sh(script: "mvn help:evaluate -Dexpression=project.version -q -DforceStdout", returnStdout: true).trim()
+                    // Remove "-SNAPSHOT" to get the release version
+                    env.DOCKER_IMAGE_VERSION = version.replace('-SNAPSHOT', '')
+                    echo "Docker image version set to: ${env.DOCKER_IMAGE_VERSION}"
+                }
+            }
+        }
+        stage('Clean Workspace') {
             steps {
                 sh "mvn clean"
             }
@@ -97,30 +110,97 @@ pipeline {
         stage('Build & Tag Docker Image') {
             steps {
                 withDockerRegistry(credentialsId: 'docker-cred', url: 'https://index.docker.io/v1/') {
-                    sh "docker build -t walidhsn/timesheet:latest ."
+                    sh "docker build -t ${env.DOCKER_REPO}:${env.DOCKER_IMAGE_VERSION} ."
                 }
             }
         }
         stage('Docker Image Scan') {
             steps {
-                // Download the Java DB for Trivy
-                sh "trivy image --download-java-db-only"
                 // Run the Trivy scan on the Docker image
-                sh "trivy image --format table -o trivy-image-report.html walidhsn/timesheet:latest"
+                sh "trivy image --java-db-repository public.ecr.aws/aquasecurity/trivy-java-db:1 --format table -o trivy-image-report.html ${env.DOCKER_REPO}:${env.DOCKER_IMAGE_VERSION}"
             }
         }
         stage('Push Docker Image') {
             steps {
                 withDockerRegistry(credentialsId: 'docker-cred', url: 'https://index.docker.io/v1/') {
-                    sh "docker push walidhsn/timesheet:latest"
+                    sh "docker push ${env.DOCKER_REPO}:${env.DOCKER_IMAGE_VERSION}"
                 }
             }
         }
-        stage('Deploy to Kubernetes') {
+        stage('Update Deployment YAML') {
             steps {
-                echo "Deploying to Kubernetes..."
-            // Add deployment steps here
+                script {
+                def currentImageTag = "${env.DOCKER_REPO}:${env.DOCKER_IMAGE_VERSION}"
+                def deploymentFile = 'backend-deployment.yaml'
+                
+                // Check if there is an image line, and capture the image tag
+                def existingImage = sh(script: "awk '/image:/ {print \$2}' ${deploymentFile}", returnStdout: true).trim()
+                
+                // Update the image version or tag
+                sh "sed -i 's|${existingImage}|${currentImageTag}|g' ${deploymentFile}"
+                
+                // commit the changes
+                sh "git add ${deploymentFile}"
+                sh "git commit -m 'Update Backend deployment image version to ${env.DOCKER_IMAGE_VERSION}'"
+                sh "git push origin HEAD"
+                }
             }
         }
+    stage('Deploy to Kubernetes') {
+            steps {
+                withKubeConfig(caCertificate: '', clusterName: 'kubernetes', contextName: '', credentialsId: 'k8s-cred', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://192.168.0.80:6443') {
+                    script {
+                        def serviceName = "backend-service"
+                        def namespace = "webapps"
+                        def mysqlDeploymentName = "mysql-deployment"
+                        def mysqlServiceName = "mysqldb"
+                        def mysqlPodReady = false
+                        def deploymentFile = "backend-deployment.yaml"
+                        // Check if the MySQL deployment exists
+                        def mysqlDeployment = sh(script: "kubectl get deployments -n ${namespace} | grep ${mysqlDeploymentName} || true", returnStdout: true).trim()
+        
+                        // If MySQL deployment doesn't exist, create it
+                        if (mysqlDeployment.isEmpty()) {
+                            echo "Deploying MySQL server..."
+                            sh "kubectl apply -f mysql.yaml"
+                             // Wait for MySQL pod to be ready
+                            echo "Waiting for MySQL pod to be ready..."
+                            timeout(time: 2, unit: 'MINUTES') { // Set a timeout for waiting
+                                waitUntil {
+                                    // Check if the MySQL pod is ready
+                                    mysqlPodReady = sh(script: "kubectl get pods -n ${namespace} -l app=mysql -o jsonpath='{.items[0].status.containerStatuses[0].ready}'", returnStdout: true).trim() == "true"
+                                    return mysqlPodReady
+                                }
+                            }
+                        } else {
+                            echo "MySQL deployment already exists. Skipping MySQL deployment."
+                        }
+        
+                        // Now that MySQL is ready, continue to update the backend deployment
+                        echo "MySQL is ready. Updating backend deployment..."
+                        sh "kubectl apply -f ${deploymentFile}"
+                        
+                        // Check if the service exists
+                        def serviceExists = sh(script: "kubectl get service ${serviceName} -n ${namespace} --no-headers | wc -l", returnStdout: true).trim()
+                        // Check if the backend service exists
+                        if (serviceExists == "0") {
+                            // Service does not exist, create it
+                            sh "kubectl apply -f backend-service.yaml"
+                        } else {
+                            echo "Service ${serviceName} already exists in namespace ${namespace}."
+                        }
+                    }
+                }
+            }
+        }
+         stage('Verify The Deployment') {
+            steps {
+                withKubeConfig(caCertificate: '', clusterName: 'kubernetes', contextName: '', credentialsId: 'k8s-cred', namespace: 'webapps', restrictKubeConfigAccess: false, serverUrl: 'https://192.168.0.80:6443') {
+                    sh "kubectl get pods -n webapps"
+                    sh "kubectl get svc -n webapps"
+                }
+            }
+             
+         }
     }
 }
