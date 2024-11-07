@@ -127,6 +127,29 @@ pipeline {
                 }
             }
         }
+ 
+        stage('Update Docker Compose File & Deploy') {
+            steps {
+                script {
+                    def currentImageTag = "${env.DOCKER_REPO}:${env.DOCKER_IMAGE_VERSION}"
+                    def composeFile = 'docker-compose.yml'
+                    
+                    // Get the existing image line for `app-foyer` service
+                    def existingImage = sh(script: "awk '/app-foyer:/ {f=1} f && /image:/ {print \$2; exit}' ${composeFile}", returnStdout: true).trim()
+                    
+                    // Update the image tag for `app-foyer` service
+                    sh "sed -i 's|${existingImage}|${currentImageTag}|g' ${composeFile}"
+                    
+                    // Commit and push changes to Git
+                    sh "git add ${composeFile}"
+                    sh "git commit -m 'Update Docker Compose image version to ${env.DOCKER_IMAGE_VERSION}'"
+                    sh "git push origin HEAD"
+                    
+                    // Deploy the updated services
+                    sh 'docker compose up -d'
+                }
+            }
+        }
         stage('Update Deployment YAML') {
             steps {
                 script {
@@ -202,5 +225,39 @@ pipeline {
             }
              
          }
+    }
+     post {
+    always {
+        script {
+                def jobName = env.JOB_NAME
+                def buildNumber = env.BUILD_NUMBER
+                def pipelineStatus = currentBuild.result ?: 'UNKNOWN'
+                def bannerColor = pipelineStatus.toUpperCase() == 'SUCCESS' ? 'green' : 'red'
+    
+                def body = """
+                    <html>
+                    <body>
+                    <div style="border: 4px solid ${bannerColor}; padding: 10px;">
+                    <h2>${jobName} - Build ${buildNumber}</h2>
+                    <div style="background-color: ${bannerColor}; padding: 10px;">
+                    <h3 style="color: white;">Pipeline Status: ${pipelineStatus.toUpperCase()}</h3>
+                    </div>
+                    <p>Check the <a href="${BUILD_URL}">console output</a>.</p>
+                    </div>
+                    </body>
+                    </html>
+                """
+    
+                emailext (
+                    subject: "${jobName} - Build ${buildNumber} - ${pipelineStatus.toUpperCase()}",
+                    body: body,
+                    to: 'walid.benhsouna@gmail.com',
+                    from: 'walid.hsn886@gmail.com',
+                    replyTo: 'walid.benhsouna@gmail.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivy-image-report.html'
+                )
+            }
+        }
     }
 }
