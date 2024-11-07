@@ -1,0 +1,7 @@
+tee -a /etc/prometheus/prometheus.yml <<EOF
+  - job_name: jenkins
+    metrics_path: /prometheus
+    static_configs:
+      - targets: ['192.168.0.70:8443']
+EOF
+
